@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Breakdown Tree Viz</title>
+  <script src="./tableau.extensions.1.latest.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #fff; color: #1a1a1a; font-size: 13px;
+    }
+
+    #state-msg {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      height: 100vh; gap: 10px;
+      color: #6b7280; font-size: 13px; text-align: center; padding: 20px;
+    }
+    #state-msg .hint { font-size: 11px; color: #9ca3af; max-width: 320px; line-height: 1.5; }
+    #state-msg.error { color: #ef4444; }
+
+    #tree-container {
+      display: none;
+      padding: 20px 16px;
+      overflow: auto;
+      height: 100vh;
+    }
+
+    .tree-wrap {
+      display: flex;
+      align-items: flex-start;
+      min-width: 400px;
+    }
+
+    /* ── Root column ── */
+    .col-root {
+      width: 160px;
+      flex-shrink: 0;
+      /* vertically center the root node relative to the children column */
+      display: flex;
+      align-items: center;
+    }
+
+    .root-node { width: 100%; }
+
+    /* ── Connector column ── */
+    .col-lines {
+      flex-shrink: 0;
+      position: relative;
+      /* width set inline via JS */
+    }
+    .col-lines svg { display: block; }
+
+    /* ── Children column ── */
+    .col-children {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    /* ── Shared node layout ── */
+    .node { display: flex; flex-direction: column; gap: 3px; }
+
+    /* ── Bar track (child bars — grey background) ── */
+    .bar-track {
+      height: 20px;
+      background: #f0f2f5;
+      border-radius: 3px;
+      overflow: hidden;
+      border: 1px solid #e5e7eb;
+    }
+
+    /* ── Root bar track — no grey, fully solid dark blue ── */
+    .bar-track-root {
+      height: 20px;
+      background: #1b3a6b;
+      border-radius: 3px;
+      width: 100%;
+    }
+
+    /* ── Child bar fill ── */
+    .bar-fill {
+      height: 100%;
+      background: #1b3a6b;
+      border-radius: 3px 0 0 3px;
+      transition: width 0.5s cubic-bezier(.4,0,.2,1);
+    }
+
+    .node-label {
+      font-size: 11px; color: #3b82f6; font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .node-sub { font-size: 10px; color: #6b7280; }
+  </style>
+</head>
+<body>
+
+<div id="state-msg">
+  <span>Connecting to Tableau…</span>
+  <span class="hint">Drag a <strong>Dimension</strong> and a <strong>Measure</strong> onto the marks card shelves.</span>
+</div>
+
+<div id="tree-container"></div>
+
+<script>
+const BAR_H  = 20;   // height of every bar (root + children)
+const LABEL_H = 30;  // approx height of label + sub-label below each bar
+const NODE_H  = BAR_H + LABEL_H;  // total height per child node slot
+const GAP     = 8;   // gap between child nodes
+const LINE_W  = 56;  // width of the SVG connector column
+
+let _worksheet = null;
+
+/* ── Helpers ── */
+function fmtVal(v) {
+  if (Math.abs(v) >= 1e9)  return "$" + (v/1e9).toFixed(2) + "B";
+  if (Math.abs(v) >= 1e6)  return "$" + (v/1e6).toFixed(1) + "M";
+  if (Math.abs(v) >= 1000) return "$" + (v/1000).toFixed(1) + "K";
+  return "$" + (+v).toFixed(1);
+}
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function showMsg(msg, hint, isError) {
+  const el = document.getElementById("state-msg");
+  el.className = isError ? "error" : "";
+  el.innerHTML = `<span>${escHtml(msg)}</span>${hint ? `<span class="hint">${hint}</span>` : ""}`;
+  el.style.display = "flex";
+  document.getElementById("tree-container").style.display = "none";
+}
+
+function showTree(html) {
+  document.getElementById("state-msg").style.display = "none";
+  const tc = document.getElementById("tree-container");
+  tc.innerHTML = html;
+  tc.style.display = "block";
+}
+
+/* ── Init ── */
+document.addEventListener("DOMContentLoaded", () => {
+  if (typeof tableau === "undefined" || !tableau.extensions) {
+    showMsg(
+      "API script not loaded.",
+      "Make sure tableau.extensions.1.latest.min.js is in the same folder as this HTML file.",
+      true
+    );
+    return;
+  }
+
+  tableau.extensions.initializeAsync().then(() => {
+    _worksheet = tableau.extensions.worksheetContent.worksheet;
+    buildTree();
+    _worksheet.addEventListener(
+      tableau.TableauEventType.SummaryDataChanged,
+      () => buildTree()
+    );
+  }).catch(err => {
+    showMsg("Tableau init failed: " + err, "", true);
+  });
+});
+
+/* ── Build tree ── */
+function buildTree() {
+  if (!_worksheet) return;
+
+  _worksheet.getSummaryDataAsync({ maxRows: 0 }).then(data => {
+    if (data.data.length === 0) {
+      showMsg("No data yet.", "Drag a Dimension and a Measure onto the marks card.", false);
+      return;
+    }
+
+    const mIdx = data.columns.findIndex(c => c.dataType === "float" || c.dataType === "int");
+    const dIdx = data.columns.findIndex(c => c.dataType === "string");
+
+    if (mIdx === -1) { showMsg("No numeric measure found.", "Drag a measure onto the marks card.", true); return; }
+    if (dIdx === -1) { showMsg("No dimension found.", "Drag a dimension onto the marks card.", true); return; }
+
+    const mField = data.columns[mIdx].fieldName;
+    const dField = data.columns[dIdx].fieldName;
+
+    // Aggregate
+    const agg = {};
+    data.data.forEach(row => {
+      const dim = String(row[dIdx].value ?? "Unknown");
+      const val = parseFloat(row[mIdx].value) || 0;
+      agg[dim] = (agg[dim] || 0) + val;
+    });
+
+    const entries = Object.entries(agg).sort((a, b) => b[1] - a[1]);
+    const total   = entries.reduce((s, [, v]) => s + v, 0);
+    if (total === 0) { showMsg("All metric values are 0.", "Check that the correct measure is on the marks card.", true); return; }
+
+    const n = entries.length;
+
+    // Total pixel height of the children column
+    const childColH = n * NODE_H + (n - 1) * GAP;
+
+    // Y center of each child's BAR (top of node + half bar height)
+    const childBarCenters = entries.map((_, i) => i * (NODE_H + GAP) + BAR_H / 2);
+
+    // Root bar center = middle of the whole children column
+    const rootBarCenterY = childColH / 2;
+
+    // SVG connectors: from left edge (x=0, touching root bar) at rootBarCenterY
+    //                 to right edge (x=LINE_W, touching child bar) at each child bar center
+    const connectors = childBarCenters.map(cy =>
+      `<path d="M0,${rootBarCenterY} C${LINE_W/2},${rootBarCenterY} ${LINE_W/2},${cy} ${LINE_W},${cy}"
+        fill="none" stroke="#d1d5db" stroke-width="1.5"/>`
+    ).join("");
+
+    const childNodes = entries.map(([label, value]) => {
+      const pct = (value / total) * 100;
+      return `
+        <div class="node">
+          <div class="bar-track">
+            <div class="bar-fill" style="width:${Math.max(pct, 0.4)}%"></div>
+          </div>
+          <div class="node-label">${escHtml(label)} (${pct.toFixed(1)}% | ${pct.toFixed(1)}%)</div>
+          <div class="node-sub">Total ${escHtml(mField)}: ${fmtVal(value)}</div>
+        </div>`;
+    }).join("");
+
+    showTree(`
+      <div class="tree-wrap" style="height:${childColH}px">
+
+        <!-- Root bar — centered vertically, same height as child bars -->
+        <div class="col-root" style="height:${childColH}px">
+          <div class="root-node">
+            <div class="bar-track-root"></div>
+            <div class="node-label">Total ${escHtml(mField)} (100%)</div>
+            <div class="node-sub">Total ${escHtml(mField)}: ${fmtVal(total)}</div>
+          </div>
+        </div>
+
+        <!-- SVG connectors: right edge of root bar → left edge of each child bar -->
+        <div class="col-lines" style="width:${LINE_W}px; height:${childColH}px;">
+          <svg width="${LINE_W}" height="${childColH}"
+               viewBox="0 0 ${LINE_W} ${childColH}"
+               xmlns="http://www.w3.org/2000/svg">
+            ${connectors}
+          </svg>
+        </div>
+
+        <!-- Child bars -->
+        <div class="col-children">
+          ${childNodes}
+        </div>
+
+      </div>
+    `);
+
+  }).catch(err => {
+    showMsg("Could not read data: " + err, "", true);
+  });
+}
+</script>
+</body>
+</html>
